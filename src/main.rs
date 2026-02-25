@@ -1,9 +1,11 @@
 use clap::Parser;
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
 const INSTRUCCIONES: &str = r#"
@@ -308,48 +310,58 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut archivos_modificados = 0usize;
-    let mut archivos_omitidos = 0usize;
-    let mut errores = 0usize;
-
-    for entry in WalkDir::new(&args.entrada)
+    // Recopilar todos los archivos .docx primero.
+    let files: Vec<(PathBuf, PathBuf, String)> = WalkDir::new(&args.entrada)
         .into_iter()
         .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            let name = path.file_name()?.to_str()?.to_string();
+            if !name.ends_with(".docx") || name.starts_with("~$") {
+                return None;
+            }
+            let relative = path.strip_prefix(&args.entrada).ok()?;
+            let output_path = args.salida.join(relative);
+            Some((path, output_path, name))
+        })
+        .collect();
 
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".docx") || name.starts_with("~$") {
-            continue;
-        }
+    let num_cpus = rayon::current_num_threads();
+    println!(
+        "Procesando {} archivo(s) en {} hilo(s)...\n",
+        files.len(),
+        num_cpus
+    );
 
-        let relative = path
-            .strip_prefix(&args.entrada)
-            .expect("la ruta debería tener el prefijo de entrada");
-        let output_path = args.salida.join(relative);
+    let archivos_modificados = AtomicUsize::new(0);
+    let archivos_omitidos = AtomicUsize::new(0);
+    let errores = AtomicUsize::new(0);
 
-        match process_docx(path, &output_path, &args.buscar, &args.reemplazar) {
+    // Procesar archivos en paralelo.
+    files.par_iter().for_each(|(path, output_path, name)| {
+        match process_docx(path, output_path, &args.buscar, &args.reemplazar) {
             Ok(0) => {
                 println!("  {} ... sin coincidencias, omitido", name);
-                archivos_omitidos += 1;
+                archivos_omitidos.fetch_add(1, Ordering::Relaxed);
             }
             Ok(n) => {
                 println!("  {} ... {} reemplazo(s) realizado(s)", name, n);
-                archivos_modificados += 1;
+                archivos_modificados.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 eprintln!("  {} ... ERROR: {}", name, e);
-                errores += 1;
+                errores.fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
+    });
 
+    let errores = errores.load(Ordering::Relaxed);
     println!();
     println!(
         "Completado: {} archivo(s) modificado(s), {} omitido(s), {} error(es)",
-        archivos_modificados, archivos_omitidos, errores
+        archivos_modificados.load(Ordering::Relaxed),
+        archivos_omitidos.load(Ordering::Relaxed),
+        errores
     );
 
     if errores > 0 {
